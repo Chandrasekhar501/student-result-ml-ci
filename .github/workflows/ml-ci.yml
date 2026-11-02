@@ -1,0 +1,96 @@
+name: Student Result ML CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train-test-deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Upgrade pip and install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Train student result model
+        run: python train_model.py
+
+      - name: Check ML quality gate
+        run: python quality_gate.py
+
+      - name: Run ML pipeline tests
+        run: python -m unittest test_ml_pipeline.py -v
+
+      - name: Run Flask application tests (Practicals 5-7)
+        run: python -m unittest test_app.py -v
+
+      - name: Run FastAPI tests (Practicals 8-11)
+        run: python -m unittest test_api.py -v
+
+      - name: Preserve validated ML artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: student-result-ml-artifacts
+          path: |
+            student_result_model.pkl
+            metrics.json
+            student_results.csv
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Prepare release candidate
+        run: |
+          mkdir -p release_candidate
+          cp app.py requirements.txt metrics.json student_result_model.pkl release_candidate/
+          printf "Student Result Prediction FastAPI application\nRun: uvicorn app:app --host 0.0.0.0 --port 8000\nHealth: GET /health\nPrediction: POST /predict\n" > release_candidate/DEPLOYMENT.txt
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: student-result-ml-release
+          path: release_candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build Docker image
+        run: docker build -t student-result-prediction:ci .
+
+      - name: Start Docker container
+        run: docker run -d --name student-result-ci -p 8000:8000 student-result-prediction:ci
+
+      - name: Test container health and prediction
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent http://localhost:8000/health; then
+              echo "Application is ready."
+              break
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              docker logs student-result-ci
+              exit 1
+            fi
+            sleep 2
+          done
+          curl --fail --silent -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            --data @test_payload.json
+
+      - name: Stop Docker container
+        if: always()
+        run: docker rm -f student-result-ci || true
